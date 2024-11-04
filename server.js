@@ -1,4 +1,4 @@
-// 安装依赖: npm init -y && npm install express node-fetch http https https-proxy-agent node-cache p-queue
+// 安装依赖: npm init -y && npm install express node-fetch http https https-proxy-agent node-cache p-queue compression redis ioredis cluster
 const express = require('express');
 const http = require('http');
 const https = require('https');
@@ -6,356 +6,409 @@ const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const fetch = require('node-fetch');
 const NodeCache = require('node-cache');
+const Redis = require('ioredis');
 const path = require('path');
+const compression = require('compression');
+const cluster = require('cluster');
+const os = require('os');
 
+// Redis配置
+const redisConfig = {
+    host: '127.0.0.1',
+    port: 6379,
+    password: '', // 如果有密码请设置
+    retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000);
+        return delay;
+    }
+};
 
+// 优化日志函数
+const log = {
+    info: (...args) => console.log(`[INFO ${new Date().toISOString()}]`, ...args),
+    error: (...args) => console.error(`[ERROR ${new Date().toISOString()}]`, ...args),
+    debug: (...args) => process.env.NODE_ENV !== 'production' && console.log(`[DEBUG ${new Date().toISOString()}]`, ...args),
+    perf: (...args) => console.log(`[PERF ${new Date().toISOString()}]`, ...args)
+};
 
-// 使用异步立即执行函数来启动服务器
-(async () => {
-    // 动态导入 p-queue
-    const { default: PQueue } = await import('p-queue');
+// 优化证书检查函数
+const checkSSLCertificates = () => {
+    const certPath = './pem/www.leavel.top.pem';
+    const keyPath = './pem/www.leavel.top.key';
     
-    const app = express();
-	app.use(express.static(path.join(__dirname,'public')))
-    // 初始化缓存，设置TTL为10分钟
-    const cache = new NodeCache({ 
-        stdTTL: 600,
-        checkperiod: 120
-    });
-
-    // 初始化请求队列，限制并发请求数
-    const queue = new PQueue({
-        concurrency: 2, // 同时处理的最大请求数
-        interval: 1000, // 间隔时间
-        intervalCap: 2  // 在间隔时间内允许的最大请求数
-    });
-
-    // 添加 JSON 解析中间件
-    app.use(express.json({ 
-        limit: '50mb',
-        strict: true
-    }));
-
-    // API Keys
-    const API_KEY = "sk-1234567890";
-    const HUGGINGFACE_API_KEY = "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";
-
-    // SSL证书配置
-    const options = {
-        key: fs.readFileSync('./pem/www.leavel.top.key'),
-        cert: fs.readFileSync('./pem/www.leavel.top.pem')
-    };
-
-    // 可用模型映射
-    const CUSTOMER_MODEL_MAP = {
-        "qwen2.5-72b-instruct": "Qwen/Qwen2.5-72B-Instruct",
-        "gemma2-2b-it": "google/gemma-2-2b-it", 
-        "gemma2-27b-it": "google/gemma-2-27b-it",
-        "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "llama-3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct",
-        "llama-3.2-3b-instruct": "meta-llama/Llama-3.2-3B-Instruct",
-        "phi-3.5": "microsoft/Phi-3.5-mini-instruct"
-    };
-
-    // 系统预设消息模板
-    const SYSTEM_PROMPT = {
-        role: 'system',
-        content: `你是专业旅行规划师。:
-            提供的内容要点需包含:
-            1. 交通方式:最快2种交通方式、时间、价格
-            2. 住宿推荐:经济/舒适型各2-3家，含位置、价格，避开青年旅社
-            3. 景点打卡:5-8个重点景点介绍，含位置、价格
-            4. 美食打卡:5-8个特色推荐，含位置、价格
-            5. 具体日程:经济/舒适两版，含具体时间安排和具体行程内容安排，含位置、价格
-            6. 预算:两种方案总费用明细无需回复任何和旅行不相关的内容。
-            请为下列出发地,目的地,人数,天数 信息制定小红书风格攻略`
-    };
-
-    // 修改：添加消息处理函数，包含文本长度估算
-    const processMessages = (messages) => {
-        if (!Array.isArray(messages)) {
-            throw new Error("messages must be an array");
+    try {
+        if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
+            throw new Error('SSL证书文件不存在');
         }
+        return {
+            cert: fs.readFileSync(certPath, 'utf8'),
+            key: fs.readFileSync(keyPath, 'utf8')
+        };
+    } catch (error) {
+        throw new Error(`SSL证书错误: ${error.message}`);
+    }
+};
 
-        // 如果第一条消息不是system role，则添加系统预设消息
-        if (messages.length === 0 || messages[0].role !== 'system') {
-            return [SYSTEM_PROMPT, ...messages];
-        }
+// 集群模式处理
+if (cluster.isMaster) {
+    const numCPUs = os.cpus().length;
+    log.info(`主进程 ${process.pid} 正在运行`);
 
-        return messages;
-    };
-
-    // 缓存键生成函数
-    const generateCacheKey = (messages, model) => {
-        const messageString = JSON.stringify(messages);
-        return `${model}_${Buffer.from(messageString).toString('base64')}`;
-    };
-
-    // CORS 中间件
-    app.use((req, res, next) => {
-        res.header("Access-Control-Allow-Origin", "*");
-        res.header("Access-Control-Allow-Methods", "*");
-        res.header("Access-Control-Allow-Headers", "*");
-        res.header("Access-Control-Max-Age", "86400");
-        
-        if (req.method === "OPTIONS") {
-            return res.status(200).end();
-        }
-        next();
-    });
-
-    // 增强的日志处理
-    const log = {
-        error: function(message, ...args) {
-            console.error(`[ERROR ${new Date().toISOString()}] ${message}`, ...args);
-        },
-        info: function(message, ...args) {
-            console.log(`[INFO ${new Date().toISOString()}] ${message}`, ...args);
-        },
-        debug: function(message, ...args) {
-            if (process.env.NODE_ENV !== 'production') {
-                console.log(`[DEBUG ${new Date().toISOString()}] ${message}`, ...args);
-            }
-        }
-    };
-
-    // 修改: 添加响应处理超时函数
-    const handleResponseWithTimeout = async (promise, timeoutMs) => {
-        let timeoutHandle;
-        
-        const timeoutPromise = new Promise((_, reject) => {
-            timeoutHandle = setTimeout(() => {
-                reject(new Error(`Request timed out after ${timeoutMs}ms`));
-            }, timeoutMs);
-        });
-
-        try {
-            const result = await Promise.race([promise, timeoutPromise]);
-            clearTimeout(timeoutHandle);
-            return result;
-        } catch (error) {
-            clearTimeout(timeoutHandle);
-            throw error;
-        }
-    };
-
-    // API调用函数修改
-    async function callHuggingFaceAPI(apiUrl, fetchOptions, retries = 3) {
-        let lastError;
-        for (let i = 0; i < retries; i++) {
-            try {
-                // 增加超时处理
-                const fetchPromise = fetch(apiUrl, fetchOptions);
-                const response = await handleResponseWithTimeout(fetchPromise, 300000); // 5分钟超时
-
-                if (response.ok) {
-                    const result = await response.json();
-                    
-                    // 验证响应内容
-                    if (!result || !result.choices || !result.choices[0] || !result.choices[0].message) {
-                        throw new Error("Invalid API response format");
-                    }
-                    
-                    return result;
-                }
-                
-                // 记录具体的错误响应
-                const errorText = await response.text();
-                lastError = new Error(`API responded with status ${response.status}: ${errorText}`);
-            } catch (error) {
-                lastError = error;
-                log.error(`API call attempt ${i + 1} failed:`, error);
-                
-                if (i < retries - 1) {
-                    const waitTime = (i + 1) * 3000;
-                    log.info(`Waiting ${waitTime}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            }
-        }
-        throw lastError;
+    // 启动工作进程
+    for (let i = 0; i < numCPUs; i++) {
+        cluster.fork();
     }
 
-    // 性能监控中间件
-    const performanceMiddleware = (req, res, next) => {
-        const start = Date.now();
-        log.info(`请求参数: ${JSON.stringify(req.body)}`);
-        
-        res.on('finish', () => {
-            const duration = Date.now() - start;
-            log.info(`${req.method} ${req.originalUrl} completed in ${duration}ms`);
-        });
-        next();
-    };
-
-    app.use(performanceMiddleware);
-	
-	app.get('/',(req,res)=>{
-		
-		res.sendFile(path.resolve(__dirname,'./public/index.html'))
-	})
-
-    // API路由配置
-    app.get('/v1/models', (req, res) => {
-        const arrs = Object.keys(CUSTOMER_MODEL_MAP).map(element => ({ 
-            id: element, 
-            object: "model" 
-        }));
-        res.json({
-            data: arrs,
-            success: true
-        });
+    cluster.on('exit', (worker, code, signal) => {
+        log.error(`工作进程 ${worker.process.pid} 已退出`);
+        // 重启工作进程
+        cluster.fork();
     });
-
-    // 主要API处理函数
-    app.post('/v1/chat/completions', async (req, res) => {
-        const startTime = Date.now();
+} else {
+    // 工作进程代码
+    (async () => {
+        const { default: PQueue } = await import('p-queue');
         
+        const app = express();
+        
+        // Redis客户端初始化
+        const redisClient = new Redis(redisConfig);
+        redisClient.on('error', (err) => log.error('Redis错误:', err));
+        redisClient.on('connect', () => log.info('Redis连接成功'));
+
+        // 内存缓存初始化
+        const memoryCache = new NodeCache({ 
+            stdTTL: 1800,
+            checkperiod: 300,
+            useClones: false,
+            deleteOnExpire: true,
+            maxKeys: 1000
+        });
+
+        // 压缩配置
+        app.use(compression({
+            level: 7,
+            threshold: 1024,
+            filter: (req, res) => {
+                if (req.headers['x-no-compression']) return false;
+                return compression.filter(req, res);
+            },
+            strategy: compression.Z_RLE
+        }));
+        
+        app.use(express.static(path.join(__dirname,'public'), {
+            maxAge: '1d',
+            etag: true
+        }));
+
+        // 请求队列配置
+        const queue = new PQueue({
+            concurrency: 15,
+            interval: 1000,
+            intervalCap: 15,
+            timeout: 60000,
+            throwOnTimeout: true,
+            autoStart: true,
+            retries: 2
+        });
+
+        // JSON解析配置
+        app.use(express.json({ 
+            limit: '5mb',
+            strict: true,
+            inflate: true,
+            type: ['application/json'],
+            verify: (req, res, buf) => {
+                try {
+                    JSON.parse(buf);
+                } catch (e) {
+                    throw new Error('Invalid JSON');
+                }
+            }
+        }));
+
         try {
-            log.info('Received chat completion request');
-            
-            // 添加详细的请求参数日志
-            log.info('Request parameters:', {
-                model: req.body.model,
-                temperature: req.body.temperature,
-                max_tokens: req.body.max_tokens,
-                messages_count: req.body?.messages?.length
-            });
-            
-            // 1. 输入验证
-            if (!req.body) {
-                return res.status(400).json({ error: "请求体不能为空" });
-            }
-
-            const data = req.body;
-            
-            if (!data.messages || !Array.isArray(data.messages) || data.messages.length === 0) {
-                return res.status(400).json({ error: "messages 参数必须是非空数组" });
-            }
-
-            // 2. 参数处理 - 修改默认的max_tokens值
-            const model = CUSTOMER_MODEL_MAP[data.model] || data.model;
-            const temperature = data.temperature || 0.7;
-            // 修改：增加默认max_tokens值
-            const max_tokens = data.max_tokens || 4096; // 根据模型实际限制调整
-            const top_p = Math.min(Math.max(data.top_p || 0.9, 0.0001), 0.9999);
-            const stream = data.stream || false;
-
-            // 3. 消息处理
-            const processedMessages = processMessages(data.messages);
-            
-            // 4. 检查缓存
-            const cacheKey = generateCacheKey(processedMessages, model);
-            const cachedResponse = cache.get(cacheKey);
-            
-            if (cachedResponse) {
-                log.info(`Cache hit for key: ${cacheKey}`);
-                const duration = Date.now() - startTime;
-                log.info(`Request served from cache in ${duration}ms`);
-                return res.json(cachedResponse);
-            }
-
-            // 5. 构建请求
-            const requestBody = {
-                model: model,
-                stream: stream,
-                temperature: temperature,
-                max_tokens: max_tokens,
-                top_p: top_p,
-                messages: processedMessages
+            const sslFiles = checkSSLCertificates();
+            const sslOptions = {
+                key: sslFiles.key,
+                cert: sslFiles.cert,
+                minVersion: 'TLSv1.3',
+                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384',
+                honorCipherOrder: true,
+                requestCert: false
             };
 
-            log.info('Sending request to HuggingFace API with body:', requestBody);
-
-            const apiUrl = `https://api-inference.huggingface.co/models/${model}/v1/chat/completions`;
-            
-            // 6. 设置请求配置
-            const fetchOptions = {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(requestBody),
-                agent: new HttpsProxyAgent('http://127.0.0.1:7890'),
-                timeout: 300000 // 5分钟超时
+            // API配置
+            const API_KEY = "sk-1234567890";
+            const HUGGINGFACE_API_KEY = "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";
+            const CUSTOMER_MODEL_MAP = {
+                "qwen2.5-72b-instruct": "Qwen/Qwen2.5-72B-Instruct",
+                "gemma2-2b-it": "google/gemma-2-2b-it",
+                "gemma2-27b-it": "google/gemma-2-27b-it",
+                "llama-3-8b-instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+                "llama-3.2-1b-instruct": "meta-llama/Llama-3.2-1B-Instruct", 
+                "llama-3.2-3b-instruct": "meta-llama/Llama-3.2-3B-Instruct",
+                "phi-3.5": "microsoft/Phi-3.5-mini-instruct"
             };
 
-            // 7. 将请求添加到队列
-            const queuedRequest = async () => {
-                log.info('Processing request in queue');
-                const response = await callHuggingFaceAPI(apiUrl, fetchOptions);
+            const SYSTEM_PROMPT = {
+                role: 'system',
+                content: `你是专业旅行规划师。请为下列出发地,目的地,人数,天数 信息制定小红书风格攻略`
+            };
+
+            // CORS配置
+            app.use((req, res, next) => {
+                res.header("Access-Control-Allow-Origin", "*");
+                res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+                res.header("Access-Control-Allow-Headers", "Content-Type,Authorization");
+                res.header("Access-Control-Max-Age", "86400");
+                res.header("X-Content-Type-Options", "nosniff");
+                res.header("X-Frame-Options", "DENY");
+                res.header("X-XSS-Protection", "1; mode=block");
                 
-                if (!response || !response.choices) {
-                    throw new Error("API 返回的数据格式不正确");
+                if (req.method === "OPTIONS") {
+                    return res.status(200).end();
+                }
+                next();
+            });
+
+            // 消息处理
+            const processMessages = (messages) => {
+                if (!Array.isArray(messages)) {
+                    throw new Error("messages必须是数组");
+                }
+                const cleanedMessages = messages.map(msg => ({
+                    role: msg.role,
+                    content: String(msg.content).trim()
+                }));
+                return cleanedMessages[0]?.role !== 'system' ? [SYSTEM_PROMPT, ...cleanedMessages] : cleanedMessages;
+            };
+
+            // 缓存键生成
+            const generateCacheKey = (messages, model) => {
+                const messageString = JSON.stringify(messages.map(m => ({
+                    role: m.role,
+                    content: m.content
+                })));
+                return `${model}_${Buffer.from(messageString).toString('base64')}`;
+            };
+
+            // API调用函数
+            const callHuggingFaceAPI = async (url, options, retries = 2) => {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 100000);
+
+                try {
+                    for (let i = 0; i <= retries; i++) {
+                        try {
+                            const response = await fetch(url, {
+                                ...options,
+                                signal: controller.signal,
+                                compress: true,
+                                timeout: 60000
+                            });
+                            
+                            if (!response.ok) {
+                                throw new Error(`API请求失败: ${response.statusText}`);
+                            }
+                            
+                            return await response.json();
+                        } catch (error) {
+                            if (i === retries) throw error;
+                            await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+                        }
+                    }
+                } finally {
+                    clearTimeout(timeout);
+                }
+            };
+
+            // 双重缓存检查函数
+            const checkCache = async (cacheKey) => {
+                // 先检查内存缓存
+                const memResult = memoryCache.get(cacheKey);
+                if (memResult) {
+                    log.debug('命中内存缓存');
+                    return { data: memResult, source: 'memory' };
                 }
 
-                log.info('API Response received:', {
-                    status: 'success',
-                    choices_length: response.choices.length,
-                    response_text_length: response.choices[0]?.message?.content?.length || 0
-                });
+                // 检查Redis缓存
+                const redisResult = await redisClient.get(cacheKey);
+                if (redisResult) {
+                    log.debug('命中Redis缓存');
+                    const parsed = JSON.parse(redisResult);
+                    // 写入内存缓存
+                    memoryCache.set(cacheKey, parsed);
+                    return { data: parsed, source: 'redis' };
+                }
 
-                cache.set(cacheKey, response);
-                return response;
+                return null;
             };
 
-            // 8. 执行队列任务
-            const result = await queue.add(queuedRequest);
+            // 写入双重缓存
+            const setCache = async (cacheKey, data) => {
+                // 写入内存缓存
+                memoryCache.set(cacheKey, data);
+                // 写入Redis缓存
+                await redisClient.set(cacheKey, JSON.stringify(data), 'EX', 1800);
+            };
+
+            // 主API路由
+            app.post('/v1/chat/completions', async (req, res) => {
+                const startTime = Date.now();
+                
+                try {
+                    if (!req.body?.messages?.length) {
+                        return res.status(400).json({ error: "messages参数必须是非空数组" });
+                    }
+
+                    const {
+                        model = '',
+                        temperature = 0.7,
+                        max_tokens = 4096,
+                        top_p = 0.9,
+                        stream = false
+                    } = req.body;
+
+                    const processedMessages = processMessages(req.body.messages);
+                    const cacheKey = generateCacheKey(processedMessages, model);
+                    
+                    // 检查缓存
+                    const cachedResult = await checkCache(cacheKey);
+                    if (cachedResult) {
+                        res.setHeader('X-Cache', `HIT-${cachedResult.source}`);
+                        return res.json(cachedResult.data);
+                    }
+                    res.setHeader('X-Cache', 'MISS');
+
+                    const modelName = CUSTOMER_MODEL_MAP[model] || model;
+                    const apiUrl = `https://api-inference.huggingface.co/models/${modelName}/v1/chat/completions`;
+                    
+                    const fetchOptions = {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${HUGGINGFACE_API_KEY}`,
+                            'Content-Type': 'application/json',
+                            'Accept-Encoding': 'gzip,deflate',
+                            'Connection': 'keep-alive'
+                        },
+                        body: JSON.stringify({
+                            model: modelName,
+                            stream,
+                            temperature,
+                            max_tokens,
+                            top_p,
+                            messages: processedMessages
+                        }),
+                        agent: new HttpsProxyAgent('http://127.0.0.1:7890'),
+                        compress: true,
+                        timeout: 600000
+                    };
+
+                    const result = await queue.add(
+                        () => callHuggingFaceAPI(apiUrl, fetchOptions),
+                        { priority: 1 }
+                    );
+
+                    // 写入缓存
+                    await setCache(cacheKey, result);
+                    
+                    // 设置响应头
+                    res.setHeader('X-Response-Time', `${Date.now() - startTime}ms`);
+                    res.json(result);
+
+                    // 记录性能指标
+                    log.perf(`请求处理完成, 耗时: ${Date.now() - startTime}ms`);
+
+                } catch (error) {
+                    log.error(`请求处理失败 (${Date.now() - startTime}ms):`, error);
+                    res.status(500).json({
+                        error: `请求处理失败: ${error.message}`,
+                        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                    });
+                }
+            });
+
+            // 错误处理中间件
+            app.use((req, res) => {
+                res.status(404).json({ error: "接口不存在" });
+            });
+
+            app.use((err, req, res, next) => {
+                log.error('未处理的错误:', err);
+                res.status(500).json({
+                    error: "服务器内部错误",
+                    message: process.env.NODE_ENV === 'production' ? '服务器错误' : err.message
+                });
+            });
+
+            // HTTP服务器(重定向到HTTPS)
+            const httpServer = http.createServer((req, res) => {
+                const httpsUrl = `https://${req.headers.host}${req.url}`;
+                res.writeHead(301, { 
+                    "Location": httpsUrl,
+                    "Cache-Control": "no-cache"
+                });
+                res.end();
+            });
+
+            // HTTPS服务器
+            const httpsServer = https.createServer(sslOptions, app);
             
-            // 9. 发送响应
-            const duration = Date.now() - startTime;
-            log.info(`Request completed successfully in ${duration}ms`);
-            
-            res.json(result);
+            // 错误处理
+            const handleServerError = (server, error) => {
+                log.error(`服务器错误: ${error.message}`);
+                if (error.code === 'EADDRINUSE') {
+                    setTimeout(() => {
+                        server.close();
+                        server.listen();
+                    }, 1000);
+                }
+            };
+
+            httpsServer.on('error', (error) => handleServerError(httpsServer, error));
+            httpServer.on('error', (error) => handleServerError(httpServer, error));
+
+            // 启动服务器
+            httpServer.listen(80, () => {
+                log.info(`工作进程 ${process.pid} - HTTP服务器运行在端口 80`);
+            });
+
+            httpsServer.listen(443, () => {
+                log.info(`工作进程 ${process.pid} - HTTPS服务器运行在端口 443`);
+            });
+
+            // 优雅退出处理
+            const gracefulShutdown = async (signal) => {
+                log.info(`收到关闭信号: ${signal}`);
+                
+                try {
+                    await Promise.all([
+                        new Promise(resolve => httpServer.close(resolve)),
+                        new Promise(resolve => httpsServer.close(resolve))
+                    ]);
+                    
+                    await queue.clear();
+                    await redisClient.quit();
+                    memoryCache.close();
+                    log.info('服务器已安全关闭');
+                    process.exit(0);
+                } catch (error) {
+                    log.error('关闭过程出错:', error);
+                    process.exit(1);
+                }
+            };
+
+            process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+            process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
         } catch (error) {
-            const duration = Date.now() - startTime;
-            log.error(`Request failed after ${duration}ms:`, error);
-            
-            res.status(500).json({
-                error: `请求处理失败: ${error.message}`,
-                details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-            });
+            log.error('服务器初始化失败:', error);
+            process.exit(1);
         }
-    });
 
-    // 404处理
-    app.use((req, res) => {
-        res.status(404).json({ error: "Not Found" });
+    })().catch(error => {
+        console.error('服务器初始化失败:', error);
+        process.exit(1);
     });
-
-    // 错误处理中间件
-    app.use((err, req, res, next) => {
-        log.error('Unhandled error:', err);
-        res.status(500).json({
-            error: "服务器内部错误",
-            message: err.message
-        });
-    });
-
-    // 创建HTTP服务器(80端口)并重定向至HTTPS
-    http.createServer((req, res) => {
-        res.writeHead(301, { "Location": "https://" + req.headers['host'] + req.url });
-        res.end();
-    }).listen(80, () => {
-        log.info('HTTP Server running on port 80');
-    });
-
-    // 创建HTTPS服务器(443端口)
-    const server = https.createServer(options, app).listen(443, () => {
-        log.info('HTTPS Server running on port 443');
-    });
-
-    // 优雅退出处理
-    process.on('SIGTERM', () => {
-        log.info('SIGTERM received. Closing servers...');
-        server.close(() => {
-            log.info('Server closed. Exiting process.');
-            process.exit(0);
-        });
-    });
-})().catch(error => {
-    console.error('Server initialization failed:', error);
-    process.exit(1);
-});
+}
